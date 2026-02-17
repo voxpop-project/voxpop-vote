@@ -10,6 +10,10 @@ const config: Config = {
     "^@api/(.*)$": "<rootDir>/src/api/$1",
     "^@/(.*)$": "<rootDir>/src/$1",
   },
+  // uuid v13+ ships ESM — must be transformed by ts-jest
+  transformIgnorePatterns: [
+    "node_modules/(?!(uuid)/)",
+  ],
 };
 
 export default config;
