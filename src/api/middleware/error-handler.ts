@@ -38,7 +38,7 @@ export function notFoundHandler(req: Request, res: Response): void {
  * Global error handler — catches thrown errors.
  */
 export function errorHandler(
-  err: Error,
+  err: Error & { statusCode?: number; status?: number; type?: string },
   _req: Request,
   res: Response,
   _next: NextFunction
@@ -48,6 +48,15 @@ export function errorHandler(
       error: err.errorCode,
       message: err.message,
       ...(err.details ? { details: err.details } : {}),
+    });
+    return;
+  }
+
+  // Handle body-parser / JSON parse errors
+  if (err.type === "entity.parse.failed" || err.statusCode === 400) {
+    res.status(400).json({
+      error: "VALIDATION_ERROR",
+      message: "Invalid JSON in request body.",
     });
     return;
   }
