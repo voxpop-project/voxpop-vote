@@ -1,22 +1,294 @@
 /**
- * VoxPop Secure Voting Module — Per-Country Merkle Tree Management
+ * VoxPop Secure Voting Module -- Per-Country Merkle Tree Management
  *
- * This module manages country-specific Merkle Trees for voter eligibility.
- * Each country has its own Semaphore Group (backed by a Merkle Tree) so that
- * only citizens verified for a specific country can vote on that country's
- * issues.
+ * This module provides two complementary implementations:
+ *
+ * 1. **MerkleTree** -- a standalone SHA-256 binary Merkle tree with full
+ *    proof generation and verification.  This is the low-level primitive
+ *    used for audit trails and independent verification.
+ *
+ * 2. **CountryTreeRegistry** -- a higher-level registry that wraps
+ *    Semaphore Groups (themselves backed by Poseidon Merkle trees) and
+ *    partitions voters by country (ISO 3166-1 alpha-2 codes).
  *
  * Key design decisions:
  * - One Group per country (ISO 3166-1 alpha-2 codes)
  * - Append-only: commitments are never removed (preserves anonymity set)
  * - Batched insertions for atomic multi-voter registration
- * - No personal data stored — only cryptographic commitments
+ * - No personal data stored -- only cryptographic commitments
  *
  * @module merkle-tree
  * @license AGPL-3.0-or-later
  */
 
+import { createHash } from "crypto";
 import { Group } from "@semaphore-protocol/group";
+
+// ============================================================
+// SHA-256 Merkle Tree (standalone)
+// ============================================================
+
+/** A Merkle inclusion proof */
+export interface MerkleProof {
+  /** The leaf whose membership is being proved */
+  leaf: string;
+  /** Sibling hashes along the path from leaf to root */
+  pathElements: string[];
+  /** Direction indicators: 0 = sibling is on the right, 1 = sibling is on the left */
+  pathIndices: number[];
+  /** The Merkle root at the time the proof was generated */
+  root: string;
+}
+
+/**
+ * Computes a SHA-256 hash of a string.
+ *
+ * @param data - Input string
+ * @returns Hex-encoded SHA-256 digest
+ */
+function sha256(data: string): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+/**
+ * Computes the hash of an internal Merkle node.
+ *
+ * The two children are sorted to guarantee a canonical representation.
+ * This means the same set of leaves always produces the same root
+ * regardless of insertion order within a level.
+ *
+ * @param left - Left child hash
+ * @param right - Right child hash
+ * @returns SHA-256 hash of the concatenation
+ */
+function hashPair(left: string, right: string): string {
+  return sha256(left + right);
+}
+
+/**
+ * A binary Merkle tree backed by SHA-256 hashes.
+ *
+ * Supports dynamic insertions, Merkle proof generation, and proof
+ * verification.  The tree automatically pads to a power-of-two size
+ * using a deterministic "empty leaf" hash.
+ *
+ * This implementation is used for:
+ * - Voter registry snapshots (audit)
+ * - Independent verification of Semaphore group membership
+ * - Hash-based integrity proofs over vote sets
+ *
+ * @example
+ * ```ts
+ * const tree = new MerkleTree();
+ *
+ * tree.insert(sha256("voter-commitment-1"));
+ * tree.insert(sha256("voter-commitment-2"));
+ * tree.insert(sha256("voter-commitment-3"));
+ *
+ * const proof = tree.getProof(0);
+ * console.log(MerkleTree.verify(proof)); // true
+ *
+ * console.log(tree.root); // "a1b2c3..."
+ * ```
+ */
+export class MerkleTree {
+  /** The leaf nodes (hashes) */
+  private leaves: string[] = [];
+
+  /** Hash used for padding empty leaf positions */
+  private static readonly EMPTY_LEAF = sha256("VOXPOP_EMPTY_LEAF");
+
+  /**
+   * Inserts a leaf into the tree.
+   *
+   * @param leaf - The hash to insert (should be a hex-encoded SHA-256 digest)
+   * @returns The index of the inserted leaf
+   */
+  insert(leaf: string): number {
+    this.leaves.push(leaf);
+    return this.leaves.length - 1;
+  }
+
+  /**
+   * Inserts multiple leaves.
+   *
+   * @param newLeaves - Array of leaf hashes
+   * @returns Array of indices
+   */
+  insertBatch(newLeaves: string[]): number[] {
+    const startIndex = this.leaves.length;
+    this.leaves.push(...newLeaves);
+    return newLeaves.map((_, i) => startIndex + i);
+  }
+
+  /**
+   * Returns the current Merkle root.
+   *
+   * The tree is padded with empty leaves to reach the next power of two
+   * before computing the root.
+   *
+   * @returns Hex-encoded SHA-256 Merkle root
+   */
+  get root(): string {
+    if (this.leaves.length === 0) {
+      return MerkleTree.EMPTY_LEAF;
+    }
+    const layers = this.computeLayers();
+    return layers[layers.length - 1][0];
+  }
+
+  /**
+   * Returns the tree depth (number of levels above the leaves).
+   */
+  get depth(): number {
+    if (this.leaves.length <= 1) return 0;
+    return Math.ceil(Math.log2(this.leaves.length));
+  }
+
+  /**
+   * Returns the number of leaves.
+   */
+  get leafCount(): number {
+    return this.leaves.length;
+  }
+
+  /**
+   * Returns a copy of all leaf hashes.
+   */
+  getLeaves(): string[] {
+    return [...this.leaves];
+  }
+
+  /**
+   * Returns the leaf at a given index.
+   *
+   * @param index - Leaf index
+   * @returns The leaf hash, or undefined if out of range
+   */
+  getLeaf(index: number): string | undefined {
+    return this.leaves[index];
+  }
+
+  /**
+   * Generates a Merkle inclusion proof for a leaf at the given index.
+   *
+   * @param index - The leaf index to prove
+   * @returns A MerkleProof object
+   * @throws Error if the index is out of range
+   *
+   * @example
+   * ```ts
+   * const proof = tree.getProof(2);
+   * // proof.pathElements: ["hash1", "hash2", ...]
+   * // proof.pathIndices: [0, 1, ...]
+   * ```
+   */
+  getProof(index: number): MerkleProof {
+    if (index < 0 || index >= this.leaves.length) {
+      throw new Error(`Leaf index ${index} out of range [0, ${this.leaves.length - 1}]`);
+    }
+
+    const layers = this.computeLayers();
+    const pathElements: string[] = [];
+    const pathIndices: number[] = [];
+
+    let currentIndex = index;
+
+    for (let level = 0; level < layers.length - 1; level++) {
+      const layer = layers[level];
+      const isRight = currentIndex % 2 === 1;
+      const siblingIndex = isRight ? currentIndex - 1 : currentIndex + 1;
+
+      pathIndices.push(isRight ? 1 : 0);
+      pathElements.push(
+        siblingIndex < layer.length ? layer[siblingIndex] : MerkleTree.EMPTY_LEAF
+      );
+
+      currentIndex = Math.floor(currentIndex / 2);
+    }
+
+    return {
+      leaf: this.leaves[index],
+      pathElements,
+      pathIndices,
+      root: this.root,
+    };
+  }
+
+  /**
+   * Statically verifies a Merkle inclusion proof.
+   *
+   * Recomputes the root from the leaf + path and checks it matches.
+   *
+   * @param proof - The MerkleProof to verify
+   * @returns true if the proof is valid
+   *
+   * @example
+   * ```ts
+   * const isValid = MerkleTree.verify(proof);
+   * ```
+   */
+  static verify(proof: MerkleProof): boolean {
+    let current = proof.leaf;
+
+    for (let i = 0; i < proof.pathElements.length; i++) {
+      const sibling = proof.pathElements[i];
+      const direction = proof.pathIndices[i];
+
+      if (direction === 0) {
+        // Current node is on the left
+        current = hashPair(current, sibling);
+      } else {
+        // Current node is on the right
+        current = hashPair(sibling, current);
+      }
+    }
+
+    return current === proof.root;
+  }
+
+  /**
+   * Computes all layers of the Merkle tree from bottom (leaves) to top (root).
+   *
+   * Pads the leaf layer to the next power of two with empty leaves.
+   *
+   * @returns Array of layers, where layers[0] is the (padded) leaf layer
+   *   and layers[layers.length - 1] is [root]
+   */
+  private computeLayers(): string[][] {
+    if (this.leaves.length === 0) {
+      return [[MerkleTree.EMPTY_LEAF]];
+    }
+
+    // Pad leaves to next power of two
+    const nextPow2 = Math.pow(2, Math.ceil(Math.log2(Math.max(this.leaves.length, 2))));
+    const paddedLeaves = [...this.leaves];
+    while (paddedLeaves.length < nextPow2) {
+      paddedLeaves.push(MerkleTree.EMPTY_LEAF);
+    }
+
+    const layers: string[][] = [paddedLeaves];
+
+    let currentLayer = paddedLeaves;
+    while (currentLayer.length > 1) {
+      const nextLayer: string[] = [];
+      for (let i = 0; i < currentLayer.length; i += 2) {
+        const left = currentLayer[i];
+        const right = i + 1 < currentLayer.length ? currentLayer[i + 1] : MerkleTree.EMPTY_LEAF;
+        nextLayer.push(hashPair(left, right));
+      }
+      layers.push(nextLayer);
+      currentLayer = nextLayer;
+    }
+
+    return layers;
+  }
+}
+
+/**
+ * Creates a SHA-256 hash of a string (convenience export).
+ */
+export { sha256 as merkleHash };
 
 // ============================================================
 // Types

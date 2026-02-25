@@ -242,3 +242,243 @@ export function createVoteConfig(params: {
     endTime: endTime.toISOString(),
   };
 }
+
+// ============================================================
+// GroupManager — Multi-Country Semaphore Group Management
+// ============================================================
+
+/**
+ * Manages Semaphore groups across multiple countries.
+ *
+ * The GroupManager is the operational layer on top of CountryTreeRegistry.
+ * It wraps Semaphore group operations with country-scoped access control
+ * and provides a unified interface for the VoteModule to interact with
+ * country-level voter registries.
+ *
+ * Key responsibilities:
+ * - Create and manage one Semaphore Group per country
+ * - Add identity commitments (voter registration)
+ * - Retrieve groups for proof generation and verification
+ * - Provide audit snapshots of group state
+ *
+ * @example
+ * ```typescript
+ * const manager = new GroupManager();
+ *
+ * // Set up country groups
+ * manager.createGroup("FR");
+ * manager.createGroup("DE");
+ *
+ * // Register voters
+ * const voter = createVoterIdentity();
+ * manager.addMember("FR", voter.commitment);
+ *
+ * // Generate a proof (voter proves they belong to the French group)
+ * const group = manager.getGroup("FR");
+ * const proof = await generateVoteProof(voter, group, "poll-1", 0);
+ * ```
+ */
+export class GroupManager {
+  /** Country code -> Semaphore Group */
+  private groups: Map<string, Group> = new Map();
+
+  /** Country code -> array of commitments (for audit trail) */
+  private commitments: Map<string, bigint[]> = new Map();
+
+  /** Country code -> creation timestamp */
+  private createdAt: Map<string, string> = new Map();
+
+  /**
+   * Creates a new Semaphore group for a country.
+   *
+   * @param countryCode - ISO 3166-1 alpha-2 code
+   * @throws Error if a group for this country already exists
+   */
+  createGroup(countryCode: string): void {
+    const code = countryCode.toUpperCase();
+
+    if (this.groups.has(code)) {
+      throw new Error(`Group for country ${code} already exists`);
+    }
+
+    this.groups.set(code, new Group());
+    this.commitments.set(code, []);
+    this.createdAt.set(code, new Date().toISOString());
+  }
+
+  /**
+   * Creates groups for multiple countries at once.
+   *
+   * @param countryCodes - Array of ISO 3166-1 alpha-2 codes
+   * @returns Array of successfully created country codes
+   */
+  createGroups(countryCodes: string[]): string[] {
+    const created: string[] = [];
+    for (const code of countryCodes) {
+      try {
+        this.createGroup(code);
+        created.push(code.toUpperCase());
+      } catch {
+        // Skip already-existing groups
+      }
+    }
+    return created;
+  }
+
+  /**
+   * Adds a voter's identity commitment to a country group.
+   *
+   * This is the "registration" step: after identity verification
+   * (eIDAS, document check, etc.), the voter's commitment is added
+   * to their country's Merkle tree.
+   *
+   * @param countryCode - The country to register in
+   * @param commitment - The voter's identity commitment (bigint)
+   * @throws Error if the country group does not exist
+   */
+  addMember(countryCode: string, commitment: bigint): void {
+    const code = countryCode.toUpperCase();
+    const group = this.groups.get(code);
+
+    if (!group) {
+      throw new Error(
+        `No group for country ${code}. Call createGroup("${code}") first.`
+      );
+    }
+
+    group.addMember(commitment);
+    this.commitments.get(code)!.push(commitment);
+  }
+
+  /**
+   * Adds multiple members to a country group (batch registration).
+   *
+   * @param countryCode - The country to register in
+   * @param memberCommitments - Array of identity commitments
+   * @returns Number of successfully added members
+   */
+  addMembers(countryCode: string, memberCommitments: bigint[]): number {
+    let count = 0;
+    for (const commitment of memberCommitments) {
+      try {
+        this.addMember(countryCode, commitment);
+        count++;
+      } catch {
+        // Continue on individual failures
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Retrieves the Semaphore Group for a country.
+   *
+   * This is the group object passed to `generateProof()` for
+   * ZKP generation or to `verifyProof()` for verification.
+   *
+   * @param countryCode - ISO 3166-1 alpha-2 code
+   * @returns The Semaphore Group
+   * @throws Error if the group does not exist
+   */
+  getGroup(countryCode: string): Group {
+    const code = countryCode.toUpperCase();
+    const group = this.groups.get(code);
+
+    if (!group) {
+      throw new Error(`No group for country ${code}`);
+    }
+
+    return group;
+  }
+
+  /**
+   * Checks if a commitment exists in a country's group.
+   *
+   * @param countryCode - ISO 3166-1 alpha-2 code
+   * @param commitment - The commitment to check
+   * @returns true if the commitment is a member
+   */
+  isMember(countryCode: string, commitment: bigint): boolean {
+    try {
+      const group = this.getGroup(countryCode);
+      return group.indexOf(commitment) !== -1;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Returns the number of members in a country's group.
+   *
+   * @param countryCode - ISO 3166-1 alpha-2 code
+   * @returns Member count (0 if country does not exist)
+   */
+  getMemberCount(countryCode: string): number {
+    const code = countryCode.toUpperCase();
+    return this.commitments.get(code)?.length ?? 0;
+  }
+
+  /**
+   * Lists all country codes with active groups.
+   *
+   * @returns Sorted array of country codes
+   */
+  listCountries(): string[] {
+    return Array.from(this.groups.keys()).sort();
+  }
+
+  /**
+   * Checks whether a group exists for a country.
+   *
+   * @param countryCode - ISO 3166-1 alpha-2 code
+   */
+  hasGroup(countryCode: string): boolean {
+    return this.groups.has(countryCode.toUpperCase());
+  }
+
+  /**
+   * Returns a snapshot of a country's group state for audit purposes.
+   *
+   * @param countryCode - ISO 3166-1 alpha-2 code
+   * @returns Audit snapshot with member count and creation time
+   */
+  getGroupSnapshot(countryCode: string): {
+    countryCode: string;
+    memberCount: number;
+    createdAt: string;
+    snapshotAt: string;
+  } {
+    const code = countryCode.toUpperCase();
+
+    return {
+      countryCode: code,
+      memberCount: this.getMemberCount(code),
+      createdAt: this.createdAt.get(code) ?? "unknown",
+      snapshotAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Returns aggregate statistics across all groups.
+   */
+  getStats(): {
+    totalCountries: number;
+    totalMembers: number;
+    perCountry: Map<string, number>;
+  } {
+    const perCountry = new Map<string, number>();
+    let totalMembers = 0;
+
+    for (const [code, commitmentList] of this.commitments) {
+      const count = commitmentList.length;
+      perCountry.set(code, count);
+      totalMembers += count;
+    }
+
+    return {
+      totalCountries: this.groups.size,
+      totalMembers,
+      perCountry,
+    };
+  }
+}
